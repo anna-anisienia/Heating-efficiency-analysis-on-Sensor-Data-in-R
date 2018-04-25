@@ -1,4 +1,4 @@
-# analytics-lab-project
+# Analytics Lab Project
 This repository contains code for NLP analysis, created for a university project.
 
 **Related topics:**
