@@ -1,2 +1,8 @@
-# hello-world
-repository to store ideas, resources, or share and discuss things with others
+# Analytics Lab Project
+This repository contains code for NLP analysis, created for a university project.
+
+**Related topics:**
+- Using APIs to obtain data for analysis
+- Web scraping in Python for additional data
+- NLP
+- Sentiment analysis
