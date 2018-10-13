@@ -1,8 +1,9 @@
-# Analytics Lab Project
-This repository contains code for NLP analysis, created for a university project.
+# Data Science Project 1
+This repository contains R code for heating efficiency analysis on Sensor Data.
 
 **Related topics:**
-- Using APIs to obtain data for analysis
-- Web scraping in Python for additional data
-- NLP
-- Sentiment analysis
+- Outlier & Anomaly detection
+- Interactive visualizations with Plotly
+- Time series analysis
+
+**Full documentation** as HTML can be downloaded from: https://drive.google.com/file/d/1y6nvbYF6llNvmbifE6DY1dTO5G0CPiQV/view?usp=sharing 
