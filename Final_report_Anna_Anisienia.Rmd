@@ -1,0 +1,1078 @@
+---
+title: "Final report: Data Science project at BSEL in cooperation with ML!PA Consulting GmbH"
+author: "Anna Anisienia - BIPM student at BSEL"
+date: "22 Januar 2018"
+output:
+  html_document:
+    toc: yes
+  pdf_document:
+    latex_engine: lualatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("D:/1_R_repository/R_dir/0_MLPA")
+Sys.setenv(TZ="Europe/Berlin")
+# function to install missing packages
+load_lib = function(lib_name){
+  if (!(lib_name %in% installed.packages()[,"Package"])) install.packages(lib_name)
+  library(lib_name, character.only=TRUE)
+}
+
+load_lib('xts')
+load_lib('zoo')
+load_lib('knitr')
+load_lib('dygraphs')
+load_lib('ggplot2')
+load_lib('plotly')
+load_lib('rpart')
+load_lib('rpart.plot')
+```
+
+<br/>
+
+The goal of this report is to analyze the heating efficiency and power consumption based on sensor data from a home automation and energy measurement system. Particularly, we are interested in finding out, whether the control system regulates the temperature well in order to balance out optimal comfort and costs. Furthermore, we are interested in finding out patterns in the typical usage of discussed devices, as well as investigating potential idle modes. 
+
+# Fact table Switch: analysis of the typical usage
+## Loading the data & preprocessing
+
+At the beginning of our analysis, we extracted the data from SQL Server as CSV file and then took the following steps:
+
+1. Read the data from csv file into R and look at its structure.
+2. Correct the column name ("ï..Date" to "Date")
+3. Change the data type of Date from Character to POSIXct
+4. Look at the data structure
+5. Look at first and last observations
+```{r warning=FALSE, message=FALSE}
+Switch <- read.csv("D:/1_R_repository/R_dir/0_MLPA/relevant tables/factSwitch.csv", sep = ";", stringsAsFactors = FALSE) # 1
+str(Switch)
+```
+to correct the column name to **Date** and change its data type to POSIXct:
+```{r warning=FALSE, message=FALSE}
+colnames(Switch)[1] = "Date" # 2
+Switch$Date = as.POSIXct(Switch$Date) #3
+str(Switch) # 4
+```
+
+## Switch data
+
+Now we can have a look at the data itself and how it is distributed.
+```{r warning=FALSE, message=FALSE}
+summary(Switch) # 4
+c(head(sort(Switch$Date)), tail(sort(Switch$Date))) # 5
+```
+
+
+### Column description
+
+* we can notice that the table has over 2 million rows and three columns:
+
+  - **Date** which ranges from 1.02.2016 to 10.03.2017
+  - **SwitchID** indicating one of the 21 switches, corresponding to lights, warm water heaters or additional radiators, spread over the office of MLPA.
+  - **STATE** showing for each timestamp whether the switch was ON or OFF at this time.
+  
+* questions that we would like to solve by using this data are: 
+
+    1. How many light sources are active at what times? 
+    2. To what extent employees use the capability of automatic switches on/off?
+    3. What is the average duration of lights ON?
+    4. On how many/ on which days employees used additional heating for the toilet? (switchID 11 and 19)
+
+### Sorts of switches
+
+Let's investigate first the names of the devices (Switches), corresponding to this fact table:
+
+```{r warning=FALSE, message=FALSE}
+Switch_names <- read.csv("D:/1_R_repository/R_dir/0_MLPA/relevant tables/mapSwitch.csv", sep = ";", stringsAsFactors = FALSE)
+colnames(Switch_names)[1] = "SwitchID"
+kable(Switch_names[, c(1,3,4)], "markdown")
+```
+
+we can see that the switches relate to the following devices:
+
+* **lights:** ID 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 21
+* **warm water heaters:** in the toilets (ID 1 and 5), and in the kitchen (ID 20)
+* **additional radiators:** in the toilets (ID 11 and 19). 
+
+Also, each switch relates to exactly one room in the office.
+
+### Creation of a time series object
+
+Now that we understand the structure of the data, we can create a time series and split the data into subsets for each switch. We will do it in the form of a list.
+```{r warning=FALSE, message=FALSE}
+Switch_xts = xts(as.matrix(Switch[, c(2, 3)]), order.by = Switch$Date)
+head(Switch_xts)
+```
+
+### Do MLPA employees work on weekends?
+
+In theory, calculating average duration ON for each switch over a certain time period ex. per day would be skewed if we included weekends and employees would not work on weekends. Let's validate it by first examining the usage of toilets during the weekend. Why toilets? Our assumption: no matter in which office room some employees work, they eventually need to go to the bathroom at some point in time :)
+
+```{r warning=FALSE, message=FALSE}
+Switch_xts3 = subset(Switch_xts, SwitchID == 3)
+weekend = Switch_xts3[which(.indexwday(Switch_xts3) %in% c(0,6)), ] # 0 = Sunday, 6 = Saturday
+head(weekend[diff(weekend$STATE) != 0, ], 20) 
+```
+
+It looks like some employees are working even during the weekend. Let's check another light switch:
+```{r warning=FALSE, message=FALSE}
+Switch_xts2 = subset(Switch_xts, SwitchID == 2)
+weekend2 = Switch_xts2[which(.indexwday(Switch_xts2) %in% c(0,6)), ]
+head(weekend2[diff(weekend2$STATE) != 0, ], 20) 
+```
+
+Here we can see as well that they are working even on some weekends. Let's see how this situation looks like for female employees:
+```{r warning=FALSE, message=FALSE}
+Switch_xts6 = subset(Switch_xts, SwitchID == 6)
+weekend6 = Switch_xts6[which(.indexwday(Switch_xts6) %in% c(0,6)), ]
+head(weekend6[diff(weekend6$STATE) != 0, ], 20)
+```
+
+The same case is present among female employees! Therefore, we can give a straight answer to this question: yes, MLPA employees work even on weekends, and that is why we will not exclude weekends from further analysis.
+
+### Splitting switches into separate subsets
+
+To divide the time series object **Switch_xts** into subgroups, we will create a list, called **switches**, so that we can then separate time series for every single switch. We will also generate and a list **switches_diff** to only account for the rows, indicating the process of turning the switch ON or OFF:
+```{r warning=FALSE, message=FALSE}
+switches = list()
+switches_diff = list()
+for (i in 1:length(unique(Switch_xts$SwitchID))) {
+  switches[[i]] = subset(Switch_xts, Switch_xts$SwitchID == i) # split into subsets for each switchID
+  switches[[i]] = merge(switches[[i]], diff(switches[[i]]$STATE), join = "inner") # append a column showing for each row the difference between current and previous observation
+  colnames(switches[[i]]) = c("SwitchID", "State", "State_Diff") # make column names consistent and clear
+  switches_diff[[i]] = subset(switches[[i]], switches[[i]]$State_Diff != 0) # save in this list only rows showing the difference in state
+}
+head(switches[[3]])
+head(switches_diff[[1]])
+```
+
+### Calculating state difference and related problems
+
+Now we want to calculate for each switch the average duration ON and find patterns about at what times and for how long the lights, warm water heaters or additional radiators are used by MLPA employees. Unfortunately, we need to solve the following problems first:
+
+* **Problem #1.** The subsets of switches are not exactly of the same structure:
+
+    - some of them have the first observation where *State = 0*
+    - some of them have the first observation where *State = 1*.
+
+* **Problem #2.** If we calculated the average duration ON just by using the current version of the switch subsets (*switches_diff*), we would get incorrect results, because then we would use the difference in a state for both:
+
+    - a time interval between turning the switch ON in the morning (STATE 1) and turning the switch OFF in the afternoon/evening after work (STATE 0)
+    - a time interval between turning the switch OFF in the afternoon/evening (STATE 0) to turning the switch ON again the next morning (STATE 1)
+
+* So this way we would calculate the difference between the STATE 1 and 0 during the day, but ALSO the time difference between the STATE 0 and 1 during the night. 
+
+### Solution
+
+* To account for those two problems, we create several new lists: 
+
+      - *switches_diff_improved*, which removes the first row, if the first observation has *State = 0*.
+      - *switches_time_diff*, which calculates the time difference between the State ON and OFF, i.e., it calculates the duration of each interval ON
+      - *start_time*, which shows for each day the first time interval, at which the switch has been turned on (in most cases: in the morning)
+      - *closing_time*, which shows for each day the time interval, at which the switch has been turned off (in most cases: in the evening)
+      - *entire_day* binds start_time and closing_time together into one time series, this way showing for each switch the lifespan of usage per working day
+      - *entire_day_time_diff* calculates the time difference within and between those periods of duration ON.
+
+```{r}
+# since xts does not provide a function startpoints, we are creating it by using endpoints:
+startpoints <- function (x, on = "days", k = 1) { 
+  head(endpoints(x, on, k) + 1, -1) 
+}
+
+# we create object that we will fill with data by using the loop 
+switches_diff_improved = list()
+switches_time_diff = list()
+start_time = list()
+closing_time = list()
+entire_day = list()
+entire_day_time_diff = list()
+
+for (i in 1:21) {
+  if (switches_diff[[i]][1]$State == 0) {
+    switches_diff_improved[[i]] = switches_diff[[i]][-1] # delete first row if the period would we incomplete
+  } else if (switches_diff[[i]][1]$State == 1) {
+    switches_diff_improved[[i]] = switches_diff[[i]]
+  }
+  switches_time_diff[[i]] = diff(index(switches_diff_improved[[i]])) # calculates the time difference between the State ON and OFF, i.e. it calculates the duration for each interval ON
+  closing_time[[i]] = switches_diff_improved[[i]][endpoints(switches_diff_improved[[i]], "days")]
+  start_time[[i]] = switches_diff_improved[[i]][startpoints(switches_diff_improved[[i]])]
+  entire_day[[i]] = rbind.xts(start_time[[i]], closing_time[[i]])
+  entire_day_time_diff[[i]] = diff(index(entire_day[[i]]))
+}
+
+head(entire_day[[3]], 10)
+head(switches_diff_improved[[3]], 30)
+head(switches_time_diff[[3]]) # every second row does not make sense and should be deleted
+head(entire_day_time_diff[[1]]) # every second row does not make sense and should be deleted
+```
+
+## Summary statistics per switch
+
+* this way we can calculate the duration ON per time interval, (but not per day) by using the list *switches_diff_improved*, i.e., for example for SwitchID = 3 we can calculate how much time employees spent in the toilet every time they went there :-)  on the other hand the list *entire_day* gives us information about the first and last time that this bathroom has been used each day, so that we can derive from this list the number of hours that this switch is generally in use every day.
+
+* in order to do it, we need to exclude every second row from the list *switches_time_diff* and *entire_day_time_diff*, because at the moment every second observation designates the difference in time that the switch has not been used.
+
+```{r}
+switches_time_diff_improved = list()
+entire_day_time_diff_improved = list()
+for (i in 1:21) {
+  switches_time_diff_improved[[i]] = switches_time_diff[[i]][seq(from = 1, length(switches_time_diff[[i]]), by = 2)]
+  entire_day_time_diff_improved[[i]] = entire_day_time_diff[[i]][seq(from = 1, length(entire_day_time_diff[[i]]), by = 2)]
+}
+
+head(switches_time_diff_improved[[3]])
+head(entire_day_time_diff_improved[[3]])
+```
+
+
+* So now we can calculate the average duration on for each switch and create a plot to identify patterns in usage of those switches.
+
+* To account for multiple summary statistics per switch, we calculate MEAN, MEDIAN, MIN, and MAX value. 
+
+```{r}
+mean_switch_usage = c()
+median_switch_usage = c()
+min_switch_usage = c()
+max_switch_usage = c()
+#mean_switch_usage_per_day = c()
+for (i in 1:21) {
+  mean_switch_usage[i] = mean(switches_time_diff_improved[[i]])
+  median_switch_usage[i] = median(switches_time_diff_improved[[i]])
+  min_switch_usage[i] = min(switches_time_diff_improved[[i]])
+  max_switch_usage[i] = max(switches_time_diff_improved[[i]])
+  #mean_switch_usage_per_day[i] = mean(entire_day_time_diff_improved[[i]])
+}
+
+summary_usage = matrix(data = c(id = 1:21, mean_switch_usage, median_switch_usage, min_switch_usage, max_switch_usage), ncol = 5, nrow = 21, dimnames =  list(paste("Switch", 1:21), c("ID", "Mean", "Median", "Min", "Max")))
+summary_usage
+```
+
+Since the table is not particularily visually appealing, we included a typical duration ON, i.e., the **median** duration, to the **room plan** of the office.
+
+```{r echo=FALSE, out.width='60%'}
+knitr::include_graphics('D:/1_R_repository/R_dir/0_MLPA/median_duration_on_per_switch.jpg')
+```
+
+## Interactive histogram for all switches
+
+* In order to analyze the distribution of all switches, we can use the following histogram. 
+
+* This way, we can observe patterns in the usage of all devices, and the plot is flexible so that it can be filtered for only specific switch IDs.
+
+* What is more, by selecting a specific region of the plot, it is possible to analyze only those switches we are interested in.
+
+```{r}
+s = list()
+for (i in 1:21) {
+  s[[i]] = as.data.frame(switches_time_diff_improved[[i]])
+  colnames(s[[i]]) = "Duration"
+}
+
+x = list(title = "Duration ON (in minutes)", range = c(0, 2000))
+y = list(title = "Number of occurrences", range = c(0, 1100))
+
+plot_ly(alpha = 0.7) %>%
+add_histogram(x = ~s[[1]]$Duration, name = "Switch 1 - Warm water heater (toilet)", visible = "legendonly") %>%
+  add_histogram(x = ~s[[2]]$Duration, name = "Switch 2 - Toilet", visible = "legendonly") %>%
+  add_histogram(x = ~s[[3]]$Duration, name = "Switch 3 - Toilet", visible = "legendonly") %>%
+  add_histogram(x = ~s[[4]]$Duration, name = "Switch 4 - Room 3") %>%
+  add_histogram(x = ~s[[5]]$Duration, name = "Switch 5 - Warm water heater (toilet)", visible = "legendonly") %>%
+  add_histogram(x = ~s[[6]]$Duration, name = "Switch 6 - Toilet", visible = "legendonly") %>%
+  add_histogram(x = ~s[[7]]$Duration, name = "Switch 7 - Room 3") %>%
+  add_histogram(x = ~s[[8]]$Duration, name = "Switch 8 - Room 2") %>%
+  add_histogram(x = ~s[[9]]$Duration, name = "Switch 9 - Room 3") %>%
+  add_histogram(x = ~s[[10]]$Duration, name = "Switch 10 - Front corridor", visible = "legendonly") %>%
+  add_histogram(x = ~s[[11]]$Duration, name = "Switch 11 - Additional radiator", visible = "legendonly") %>%
+  add_histogram(x = ~s[[12]]$Duration, name = "Switch 12 - Back corridor", visible = "legendonly") %>%
+  add_histogram(x = ~s[[13]]$Duration, name = "Switch 13 - Room 1") %>%
+  add_histogram(x = ~s[[14]]$Duration, name = "Switch 14 - Kitchen lobby", visible = "legendonly") %>%
+  add_histogram(x = ~s[[15]]$Duration, name = "Switch 15 - Room 3") %>%
+  add_histogram(x = ~s[[16]]$Duration, name = "Switch 16 - Conference room") %>%
+  add_histogram(x = ~s[[17]]$Duration, name = "Switch 17 - Kitchen", visible = "legendonly") %>%
+  add_histogram(x = ~s[[18]]$Duration, name = "Switch 18 - Room 3 (back)") %>%
+  add_histogram(x = ~s[[19]]$Duration, name = "Switch 19 - Additional radiator", visible = "legendonly") %>%
+  add_histogram(x = ~s[[20]]$Duration, name = "Switch 20 - Warm water heater (kitchen)", visible = "legendonly") %>%
+  add_histogram(x = ~s[[21]]$Duration, name = "Switch 21 - Entrance", visible = "legendonly") %>%
+  layout(barmode = "overlay") %>% layout(xaxis = x, yaxis = y)
+```
+<br/>
+
+By looking at the following plot, we can assume that:
+
+* selected switches are only the office rooms and we can see that the duration ON varies a lot due to aspects such as:
+
+    - varying number of working students and the number of hours they work, as well as at which times of the day
+    - employees working at clients
+    - absence due to illness or holidays
+
+* for several switches employees probably use the capability of automatic switching on/off, ex.:
+
+    - toilets: switches #2, #3, #6 turn off automatically after 5-10 min
+    - corridor in the back: also the light is turned off automatically after 5 minutes (ID #12)
+    - kitchen lobby: the light is always switched off after 10 minutes (ID #14)
+  
+* the additional radiator in the women's bathroom (ID #11) seems to be automatically switched off (after the female employee leaves the room) or used very rarely, as in the distribution we can see that it is mainly used only for 5 minutes, occasionally it is ON for 15 minutes.
+
+* all water heaters (ID #1, #5, #20) have the same distribution, which shows that they must be programmed in the same way. All of them are almost always used for 10 hours. Could it be improved? Do the water heaters need to be almost always on?
+
+* since conference room is not as frequently used as other rooms, the light consumption is also lower, i.e., around 90 min per day (ID # 16).
+
+* all other office rooms were used very differently, depending on when the employees are working, how many working students were there and for how long. Therefore, there is no clear pattern in their consumption.  
+
+* *Side note:* to clear the selection (deselect all), double click on one of the switches. Also, to select all of them again, double click on one of the switches. Toggle Spike Lines option helps to see exact value in the distribution by hovering over it.
+
+## On which days employees used additional heating for the toilet? 
+
+* switchID #11 and #19
+
+* First of all, let's find out how many times those additional heaters have been used.
+```{r warning=FALSE, message=FALSE}
+switch11 = switches_diff_improved[[11]]
+switch19 = switches_diff_improved[[19]]
+head(switch11)
+head(switch19)
+```
+
+```{r}
+paste("Switch 11 was used", nrow(switch11)/2, "times.")
+paste("Switch 19 was used", nrow(switch19)/2, "times.")
+```
+
+Now, on how many days they were used?
+```{r}
+paste("Switch 11 was used on", length(endpoints(switch11, "days")), "days.")
+paste("Switch 19 was used on", length(endpoints(switch19, "days")), "days.")
+```
+
+So, how frequently they were used per day on average?
+```{r}
+paste("Switch 11 was used approximately", round(nrow(switch11)/2/length(endpoints(switch11, "days"))), "times per day.")
+paste("Switch 19 was used approximately", round(nrow(switch19)/2/length(endpoints(switch19, "days"))), "times per day.")
+```
+
+## At which times the light sources were active in December 2016?
+
+```{r warning=FALSE, message=FALSE}
+december16 = Switch_xts["201612"]
+head(december16)
+tail(december16)
+december16_sw9 = subset(december16, SwitchID == 9)
+```
+
+A plot only for 1 selected switch (ID #9) in December 2016:
+```{r}
+dygraph(december16_sw9[, 2]) %>% dyOptions(fillGraph = TRUE) %>% dyRangeSelector()
+```
+
+
+### Interpretation
+
+* By looking at this plot, we can notice that employees in the room #3.3 usually turn on the lights in the office only in the afternoon. The light switch for this table group was not used in the morning during this period.
+
+## Conclusion of the Switch analysis
+
+We conclude this part of report by visualizing the usage of all switches for December 2016:
+```{r}
+dygraph(december16[, 2]) %>% dyOptions(fillGraph = TRUE) %>% dyRangeSelector()
+```
+
+<br/>
+
+By looking at this last graph, we can see the time period in which any kind of switches has been used in the office in December. If we select a very narrow period such as 1 or 2 days, we can see that the lights or other devices start working already before 8 a.m. and usually work at least until 5 p.m.
+
+* We deliberately created those two plots just for a subset of December or Switch #9 to speed up the performance.
+
+* The same logic of plotting the time series can be used to visualize the data for other months of the year and all other switches. 
+
+* We should keep in mind that this fact table **factSwitch** contains over 2 million rows and this is just sensor data for one year. We, therefore, recommend always subsetting the data that we are particularly interested in and use only this subset for further analysis.
+
+
+# Heating efficiency analysis
+
+## Data loading & Preprocessing
+
+At the beginning of our analysis, we extracted the data from SQL Server as CSV file and then took the following steps:
+
+1. Read the data from CSV file into R and look at its structure.
+2. Correct the column name ("ï..Date" to "Date")
+3. Change the data type of Date from Character to POSIXct
+4. Look at the data structure
+5. Look at first and last observations
+
+```{r}
+radiator = read.csv("D:/1_R_repository/R_dir/0_MLPA/relevant tables/factRadiator.csv", sep = ";", stringsAsFactors = FALSE) # Step 1
+str(radiator) # Step 1
+colnames(radiator)[1] = "Date" # Step 2
+radiator$Date = as.POSIXct(radiator$Date) # Step 3
+str(radiator) # Step 4
+kable(rbind(head(radiator), tail(radiator)), "markdown") # Step 5
+```
+
+
+## Description of the dataset
+
+* By looking at this data frame, we see that there are 1.2 million rows in this fact table.
+
+* As a result of a meeting with Dr. Lockau, the group was able to identify data tables and columns which are particularly significant for this project. It turned out that, in this fact table, the column **BATTERY_STATE** is not suitable for our task, as it only shows the state of the battery between 2.6 and 3.00 units, which does not have any effect on the heating efficiency analysis.
+
+For this reason, we remove the column BATTERY_STATE:
+```{r}
+radiator = radiator[-3]
+str(radiator)
+```
+
+
+### List of relevant columns
+
+1. **Date** - it is a timestamp of each observation, measured approximately every 5 minutes
+2. **RadiatorID** - unique identifier for each of 13 radiators located in the office of MLPA:
+
+```{r echo=FALSE, out.width='60%'}
+knitr::include_graphics('D:/1_R_repository/R_dir/0_MLPA/raumplan.jpg')
+```
+<br/>
+
+3. **VALVE_STATE**  denotes the value of a valve, which ranges between 0 and 99, with a $mean = 10.34$ and $median = 0$. This value is set by the control system to reach the desired room temperature expressed in the column SET_TEMPERATURE.
+4. **ACTUAL_TEMPERATURE** indicates the current value of the room temperature for each timestamp.
+5. **SET_TEMPERATURE** means a desired temperature which is set up by using a thermostat.
+
+### Aspects influencing the heating efficiency
+
+By looking at columns above, we can see that the room temperature and corresponding heating efficiency are affected by a number of different variables:
+
+1. Temperature outside (**weather data**)
+2. Desired temperature set in thermostat system (ex. setting the temperature to 22 degrees during the day and 6 degrees during the night), expressed in the column **SET_TEMPERATURE**
+3. Temperature set by using the valve, shown in the column **VALVE_STATE**. This value is set exclusively by the thermostat's control system, which tries to reach the desired room temperature by continuously comparing the current room temperature (ACTUAL_TEMPERATURE) with the desired SET_TEMPERATURE and adjusting the VALVE_STATE accordingly. Therefore, it is not possible for employees to change this VALVE_SET manually. They only can influence the performance of the radiator by overwriting the desired SET_TEMPERATURE for some time interval 
+4. Actual temperature in the room => **ACTUAL_TEMPERATURE**, which may be affected by the following two variables:<br/>
+4.1 Using **additional electrical heaters** that are currently not accounted for in the data<br/>
+4.2 **Opening windows** (how often and for how long they are open) is another factor which is not represented in the data.<br/>
+
+
+## Subsetting the radiator data
+
+* In order to conduct a time series analysis, we need to split our data into subsets. 
+
+* Each subgroup should contain only data for a specific radiator, ex. RadiatorID = 1. 
+
+* Subsetting is necessary to observe, how the **heating efficiency** (with regard to the **comfort** and **savings**) can be achieved for each particular room in the office. 
+
+* Also, this way we are able to see patterns present only in specific data subsets.
+
+* Probably most *versatile* and *efficient* way of splitting this data for radiators is the use of a **list**, that would contain one list element for each radiator subset.
+
+* The list allows us at the same time to apply multiple functions and loop over it.
+
+
+The following steps are necessary to enable further analysis:
+
+1. **Transformation of data type:** Converting integer values to numeric, so that all relevant variables (besides the Date column) are in the same consistent data type. This consistency is essential to convert data frame to a matrix and use it for time series analysis, as *xts requires matrix + index of time*.
+2. **Transformation of data structure:** Converting data frame to a matrix (except for the Date column)
+3. **Transformation to xts object:** Creating xts object to allow for the use of standardized functions available in **xts** and **zoo** R packages.
+4. **Creation of a list:** Creating a list in order to split the time series matrix by RadiatorID into separate subsets, accessible via list index.
+4.1 *Within a list:* Aggregating the values by the hour to compare them later on to hourly weather data.
+4.2 *Within a list:* Truncate the minutes and seconds in order to merge this data with hourly weather data by using an inner join, joining on the time index.
+
+```{r}
+radiator$RadiatorID = as.numeric(radiator$RadiatorID) # Step 1
+radiator$VALVE_STATE = as.numeric(radiator$VALVE_STATE) # Step 1
+str(radiator)
+```
+```{r}
+matrix_radiator = as.matrix(radiator[, -1]) # Step 2
+kable(head(matrix_radiator), "markdown")
+```
+```{r}
+xts_radiator = xts(matrix_radiator, order.by = radiator$Date) # Step 3
+head(xts_radiator)
+```
+
+```{r}
+xts_radiators = list() # Step 4
+
+for (i in 1:length(unique(xts_radiator$RadiatorID))){
+  xts_radiators[[i]] = xts_radiator[xts_radiator$RadiatorID == i, ] # Step 4
+  xts_radiators[[i]] = to.period(xts_radiators[[i]], "hours", OHLC = F) # Step 4.1
+  index(xts_radiators[[i]] ) = as.POSIXct(trunc(index(xts_radiators[[i]] ), units="hours")) # Step 4.2
+}
+
+head(xts_radiators[[1]])
+```
+
+## Weather data
+
+* We obtained hourly weather data for the Eastern region of Berlin (weather station located in Marzahn, compared to MLPA situated in Friedrichshain) from DWD (Deutscher Wetterdienst = German Meteorological Office: ftp://ftp-cdc.dwd.de/pub/CDC/observations_germany/climate/hourly/air_temperature/) 
+
+* this data contains **hourly** temperature observations for two years: 2016 and 2017. In particular, we are interested in the winter period from 1.10.2016 till 10.03.2017. 
+
+* In the following we are taking six preprocessing steps:
+
+1. Loading the data into R and look at its structure
+2. Transforming the *Integer* column **MESS_DATUM** to a Character column.
+3. Converting Character Date column to a *POSIXct* data type column in order to create an xts object later on.
+4. Looking at the data structure and first rows.
+5. Creating a time series object (xts).
+6. Subsetting only data from the following period: from 2016-02-01 16:00 till 2017-03-10 00:00. We could skip this step, but we do it just to speed up merging with the radiator data (available precisely for this time interval).
+
+```{r}
+weather = read.csv("D:/1_R_repository/R_dir/0_MLPA/relevant tables/DWD_weather16-17.csv", sep = ";", stringsAsFactors = FALSE) # Step 1
+str(weather) # Step 1
+```
+
+Now it is evident, why Step #2 and #3 are required.
+
+```{r}
+weather$MESS_DATUM = as.character(weather$MESS_DATUM) # Step 2
+weather$MESS_DATUM = as.POSIXct(weather$MESS_DATUM, format = "%Y%m%d%H") # Step 3
+str(weather) # Step 4
+head(weather) # Step 4
+```
+
+* We found out that the index value for the row nr 2067 (i.e., for 2016-03-27 at 02:00:00) and row nr 10802 (i.e., for 2017-03-26 at 02:00:00) are missing, even though those values are present in the CSV file.
+
+```{r}
+#weather[which(is.na(weather)),]
+weather[c(2066, 2067, 2068, 10801, 10802, 10803), ]
+weather[c(2066, 2067, 2068, 10801, 10802, 10803), ]
+```
+
+
+* After closer examination, it turned out that *xts* set those indices of time to NA for a good reason, namely it was in both cases the **daylight saving time**. Therefore, generally speaking, those timestamps do not exist, as when the local standard time was about to reach the 26.03.2017 (or 27.03.2016), 02:00:00 clocks were turned forward 1 hour to 26.03.2017 (or 27.03.2016), 03:00:00.
+
+* To handle this problem, we remove those two values.
+
+```{r}
+weather = weather[-c(2067, 10802), ]
+#weather = weather[!is.na(weather), ]  # delete row
+sum(is.na(weather))
+weather[c(2066, 2067, 2068, 10801, 10802, 10803), ]
+```
+
+
+It looks OK. Now we need to create an xts object (step #5).
+
+```{r}
+weather_xts = xts(weather$TT_TU, order.by = weather$MESS_DATUM) # Step 5
+head(weather_xts)
+```
+
+*Side note:* for subsetting we use the fact that xts supports the ISO 8601:2004 standard, allowing for a smooth selection of time intervals.
+
+```{r}
+weather_xts = weather_xts["20160201T1600/20170310T0000"] # Step 6
+rbind(head(weather_xts), tail(weather_xts))
+```
+
+## Merging the weather data with radiator data
+
+* Last fundamental step in preprocessing is merging or joining the weather data with the radiator data (i.e., with every subset of radiator data that has been converted to xts object). For this purpose, we have already split the radiator time series into separate subgroups for every single radiator and made all preprocessing steps to convert each of those subsets into xts object that is of the same structure as weather data.
+
+
+* Now we can finally merge the weather data with radiator data:
+```{r}
+for (i in 1:length(unique(xts_radiator$RadiatorID))){
+  xts_radiators[[i]] = merge(xts_radiators[[i]], weather_xts, join = "inner")
+}
+kable(head(xts_radiators[[3]]), "markdown")
+```
+
+## First results
+
+We can now just have a glimpse at the small partition of the data to see how it looks like:
+
+```{r}
+xts_rad3 = xts_radiators[[3]]["20161201"]
+xts_rad3[, -1] # the column RadiatorID is not needed, as this subset is only for this radiator #3
+```
+
+**We notice in this small example that:**
+
+* While nobody is in the office at night, the desired temperature (SET_TEMPERATURE), which is set up by using thermostat settings, is set to the value of 6 degrees, which is fine. Also, the VALVE_STATE during this time interval is set to 0, which makes sense.
+
+* But then when employees started working at 8 a.m. on 1.12.2016, the VALVE_STATE was set to the **maximum value of 99** and stayed that way **for 15 hours**, until 11 p.m. **Why did it happen?** It seems that employee who started working between 8 and 10 a.m. overwrote the desired temperature, which was set to 23 degrees and they changed it to 26.5 degrees, which had an effect that VALVE_STATE stayed at the max. value of 99 until 11 p.m. 
+
+* This change of the desired temperature caused the actual room temperature to increase, reaching the value of 26 degrees at 7 p.m. Since just one hour later the temperature suddenly decreased, even though all other parameters stayed the same, we presume that somebody opened the window at 8 p.m.
+
+* Overriding the SET_TEMPERATURE to such high temperature is not efficient, as **a lot of energy is dissipated if one set the desired temperature too high**, i.e., to the maximum value: the warmer the office is, the faster thermal energy will be lost to the outside. The lower the temperature is inside of the room, the slower the rate of thermal energy loss. It, of course, does not mean, that it should always be freezing in the office, but a tradeoff between comfort and costs is required for optimal heating results.
+
+* To achieve optimal comfort and optimal costs, **it is recommended to set the thermostats between 20 to 22.2 degrees Celsius** and keep it at the steady level during the day, i.e., when employees are in the office.
+
+* Between 7 p.m. and 11 p.m. on 1.12.2016 the VALVE_STATE is set to 99 because the standard SET_TEMPERATURE was overwritten and set to 26.5 degrees. 
+
+* Also, it is unclear, if the employees were indeed working as late at night (until 11 p.m.). Let's check this by looking at the fact table Switch for this day and this office, to see if any employees had the lights on in the office 2.1 on the 1.12.2016:
+```{r warning=FALSE, message=FALSE}
+december16_sw8 = subset(Switch_xts["20161201"], SwitchID == 8)
+dygraph(december16_sw8[, 2]) %>% dyOptions(fillGraph = TRUE) %>% dyRangeSelector()
+```
+As we can see, the lights were on only until 8 p.m. and that is why, we can validate our assumption, that the radiator was used in idle mode on this day.
+
+
+### Potential usage of radiators in idle modes 
+
+To investigate this further, we will take advantage of the above mentioned assumption: if employees were working late at night and have caused the Valve state to increase by changing the desired temperature, they should have the lights on. If the lights were off at this time, it implies a potential idle usage of radiators. 
+
+1. First, we subset only night time from the radiator time series, let's say between 10 p.m. and 4 a.m.
+2. Secondly, we subset only those observations, where VALVE_STATE at night was above 90.
+3. Next, we subset only night time from the switch time series (between 10 p.m. and 4 a.m.).
+4. In the final step, we need to map the relevant light switches to the radiator data and merge them.
+
+```{r warning=FALSE, message=FALSE}
+night_shift_radiator = xts_radiator["T22:00/T04:00"] # 1
+night_shift_radiator_high_valve = subset(night_shift_radiator, VALVE_STATE >= 90) # 2
+head(night_shift_radiator_high_valve) #1050 rows
+
+night_shift_switch = Switch_xts["T22:00/T04:00"] #3
+head(night_shift_switch)
+```
+
+In the next step, we need to map the radiators to the related light switches.
+```{r echo=FALSE, out.width='60%'}
+knitr::include_graphics('D:/1_R_repository/R_dir/0_MLPA/switch_radiator_room_plan.jpg')
+```
+
+We need to merge the following radiators (corresponding to respective office numbers) to light switches, available in each office:
+
+* **Office 1.1:** Rad #6 + Switch #13 
+* **Office 1.2:** Rad #2 + Switch #13 
+* **Office 2.1:** Rad #3 + Switch #8 
+* **Office 2.2:** Rad #13 + Switch #8 
+* **Office 2.3:** Rad #11 + Switch #8 
+* **Office 3.1:** Rad #1 + Switch #4, #7, #9, #15, #18 
+* **Office 3.2:** Rad #8 + Switch #4, #7, #9, #15, #18 
+* **Office 3.3:** Rad #4 + Switch #4, #7, #9, #15, #18 
+* **Office 3.4:** Rad #7 + Switch #4, #7, #9, #15, #18 
+* **Conference room:** Rad #5 + Switch #16
+* **Back corridor:** Rad #10 + Switch #12
+* **Front corridor:** Rad #9 + Switch #10
+* **Kitchen:** Rad #12 + Switch #17
+
+
+For all switches, we need to find only observations, where the lights were on (STATE != 0), because this would justify having radiators running on high VALVE_STATE during the night. Therefore, we create a left join to merge the relevant switch data only in case that it would justify using radiators at night, otherwise generate NAs in the merged column.
+
+
+**Office 1.1:**
+```{r warning=FALSE, message=FALSE}
+idle_mode_office_1.1 = merge(subset(night_shift_radiator_high_valve, RadiatorID == 6), subset(night_shift_switch, SwitchID == 13 & STATE != 0), join = "left")
+head(idle_mode_office_1.1, 10)
+nrow(idle_mode_office_1.1)
+```
+
+**Office 1.2:**
+```{r warning=FALSE, message=FALSE}
+idle_mode_office_1.2 = merge(subset(night_shift_radiator_high_valve, RadiatorID == 2), subset(night_shift_switch, SwitchID == 13 & STATE != 0), join = "left")
+head(idle_mode_office_1.2, 10)
+nrow(idle_mode_office_1.2)
+```
+
+**Office 2.1:**
+```{r warning=FALSE, message=FALSE}
+idle_mode_office_2.1 = merge(subset(night_shift_radiator_high_valve, RadiatorID == 3), subset(night_shift_switch, SwitchID == 8 & STATE != 0), join = "left")
+head(idle_mode_office_2.1, 10)
+nrow(idle_mode_office_2.1)
+```
+
+**Office 2.2:**
+```{r warning=FALSE, message=FALSE}
+idle_mode_office_2.2 = merge(subset(night_shift_radiator_high_valve, RadiatorID == 13), subset(night_shift_switch, SwitchID == 8 & STATE != 0), join = "left")
+head(idle_mode_office_2.2, 10)
+nrow(idle_mode_office_2.2)
+```
+
+**Office 2.3:**
+```{r warning=FALSE, message=FALSE}
+idle_mode_office_2.3 = merge(subset(night_shift_radiator_high_valve, RadiatorID == 11), subset(night_shift_switch, SwitchID == 8 & STATE != 0), join = "left")
+head(idle_mode_office_2.3, 10)
+nrow(idle_mode_office_2.3)
+```
+
+**Office 3.1:**
+```{r warning=FALSE, message=FALSE}
+idle_mode_office_3.1 = merge(subset(night_shift_radiator_high_valve, RadiatorID == 1), subset(night_shift_switch, SwitchID %in% c(4, 7, 9, 15, 18) & STATE != 0), join = "left")
+head(idle_mode_office_3.1, 10)
+nrow(idle_mode_office_3.1)
+```
+
+**Office 3.2:**
+```{r warning=FALSE, message=FALSE}
+idle_mode_office_3.2 = merge(subset(night_shift_radiator_high_valve, RadiatorID == 8), subset(night_shift_switch, SwitchID %in% c(4, 7, 9, 15, 18) & STATE != 0), join = "left")
+head(idle_mode_office_3.2, 10)
+nrow(idle_mode_office_3.2)
+```
+
+**Office 3.3:**
+```{r warning=FALSE, message=FALSE}
+idle_mode_office_3.3 = merge(subset(night_shift_radiator_high_valve, RadiatorID == 4), subset(night_shift_switch, SwitchID %in% c(4, 7, 9, 15, 18) & STATE != 0), join = "left")
+head(idle_mode_office_3.3, 10)
+nrow(idle_mode_office_3.3)
+```
+
+**Office 3.4:**
+```{r warning=FALSE, message=FALSE}
+idle_mode_office_3.4 = merge(subset(night_shift_radiator_high_valve, RadiatorID == 7), subset(night_shift_switch, SwitchID %in% c(4, 7, 9, 15, 18) & STATE != 0), join = "left")
+head(idle_mode_office_3.4, 10)
+nrow(idle_mode_office_3.4)
+```
+
+**Conference room:**
+```{r warning=FALSE, message=FALSE}
+idle_mode_conference_room = merge(subset(night_shift_radiator_high_valve, RadiatorID == 5), subset(night_shift_switch, SwitchID == 16 & STATE != 0), join = "left")
+head(idle_mode_conference_room, 10)
+nrow(idle_mode_conference_room)
+```
+
+
+**Back corridor:**
+```{r warning=FALSE, message=FALSE}
+idle_mode_back_corridor = merge(subset(night_shift_radiator_high_valve, RadiatorID == 10), subset(night_shift_switch, SwitchID == 12 & STATE != 0), join = "left")
+head(idle_mode_back_corridor, 10)
+nrow(idle_mode_back_corridor)
+```
+
+
+**Front corridor:**
+```{r warning=FALSE, message=FALSE}
+idle_mode_front_corridor = merge(subset(night_shift_radiator_high_valve, RadiatorID == 9), subset(night_shift_switch, SwitchID == 10 & STATE != 0), join = "left")
+head(idle_mode_front_corridor, 10)
+nrow(idle_mode_front_corridor)
+```
+
+
+**Kitchen:**
+```{r warning=FALSE, message=FALSE}
+idle_mode_kitchen = merge(subset(night_shift_radiator_high_valve, RadiatorID == 12), subset(night_shift_switch, SwitchID == 17 & STATE != 0), join = "left")
+head(idle_mode_kitchen, 10)
+nrow(idle_mode_kitchen)
+```
+
+**Interpretation:**
+In all tables above, we can see that all rows indicate idle usage of radiator, because no lights were on during those time periods. This means that no employees were working at those times. Except for the Offices 2.1, 2.2 and the conference room, havig 100 rows, all other rooms have 75 observations, at which we can observe idle usage of radiators.
+To sum up our findings, we recommend avoiding the idle usage of radiators by programming the thermostat to turn the Valve down at night, even when the desired temperature will be overwritten by employees.
+
+
+## Influencing variables
+
+### Effect of SET_TEMPERATURE, VALVE_STATE and weather data on the actual (room) temperature
+
+**Recap: influencing variables** - as we mentioned earlier, the temperature is affected by following aspects:
+
+1. Temperature outside => **weather_xts**
+2. Desired temperature value => **SET_TEMPERATURE** set in thermostat system settings to reach the desired room temperature. 
+3. Temperature set by control system => **VALVE_STATE** to reach the desired SET_TEMPERATURE.
+4. Actual temperature in the room => **ACTUAL_TEMPERATURE**, which may be affected by the following two variables:<br/>
+4.1 Using **additional electrical heaters** => not in the data<br/>
+4.2 **Opening windows** => not in the data.<br/>
+
+### Plots
+
+* In order to account for those variables, let's visualize them in a plot. Our goal is to better understand the impact of thermostat settings and other aspects on the actual room temperature that we wish to optimize.
+
+* We decided to do this by using **interactive charts** so that it is possible to zoom in and out. 
+
+* Interactive charts enable us, at the same time, to see **general patterns**, and to **drill down** into details for specific values, as well as the date and time intervals.
+
+* We could generate one plot for each radiator, but for the sake of simplicity, we plot the time series just for one heater (we have already inspected the situation, and it looks very similar for all radiators). Let's pick RadiatorID = 3 for the office #2.1.
+
+```{r}
+rad3 = xts_radiators[[3]]
+kable(head(rad3), "markdown")
+```
+
+**Again, our analysis requires some preprocessing steps:**
+
+1. Excluding the summer (i.e., warm months May - September)
+2. Creating a difference of subsequent SET_TEMPERATURE values to attach a column of changes relative to the previous observation.
+3. Merging of this new column (# 1) with the xts object rad3.
+4. Adjusting the name of the merged column.
+5. Plotting of the interactive histogram.
+
+
+**Step # 1.** Exclude summer months
+```{r}
+rad3_1 = rad3["20160201/20160430"]
+rad3_2 = rad3["20161001/20161231"]
+rad3_3 = rad3["20170101/20170311"]
+rad3 = rbind.xts(rad3_1, rad3_2, rad3_3)
+```
+
+**Step # 2.** Create a difference of subsequent SET_TEMPERATURE values
+
+```{r}
+set_temp_diff = diff(rad3[, "SET_TEMPERATURE"])
+head(set_temp_diff)
+```
+
+**Step # 3.** Now let's merge this new column (# 1) with the xts object rad3.
+```{r}
+rad3_diff = cbind.xts(rad3, set_temp_diff, join = "inner")
+summary(rad3_diff)
+```
+
+**Step # 4.** Since the column SET_TEMPERATURE.1 is unclear, let's change the name of it:
+
+```{r}
+colnames(rad3_diff)[6] = "DIFF_SET_TEMP"
+kable(head(rad3_diff), "markdown")
+```
+
+**Step # 5.** The following histogram presents the distribution of all influencing aspects.
+
+```{r warning=FALSE, message=FALSE}
+rad3_df = as.data.frame(rad3_diff)
+x = list(title = "Influence of Desired Temp. & Valve on room temp. (Diff. in Set Temp)")
+y = list(title = "Number of occurrences")
+
+plot_ly(alpha = 0.6) %>%
+  add_histogram(x = ~rad3_df$SET_TEMPERATURE, name = "Desired Temperature") %>%
+  add_histogram(x = ~rad3_df$VALVE_STATE, name = "State of the Valve") %>%
+  add_histogram(x = ~rad3_df$DIFF_SET_TEMP, name = "Difference in Set Temperature") %>%
+  add_histogram(x = ~rad3_df$ACTUAL_TEMPERATURE, name = "Actual Room Temperature") %>%
+  add_histogram(x = ~rad3_df$weather_xts, name = "Outside Temperature") %>%
+  layout(barmode = "overlay") %>% layout(xaxis = x, yaxis = y)
+
+```
+
+<br/>
+**From the following plot, we can find out that:**
+
+* **Desired Temperature** usually takes on values of 6 during the night and 22 during the day. Those two values are incorporated into thermostat settings and control system should adjust the VALVE_STATE to attain this desired temperature. However, this value can be overwritten by employees, which occurred few times (we can see it in the plot), reaching the total amount of around 200 hours when the Desired Temperature for this radiator (ID = 3) was not set to the value of 6 or 22 degrees.
+
+* **State of the Valve** in most cases is either set to 0 or the maximum value of 99. This prevalence of extreme VALVE values shows that there is a room for improvement with regard to the heating efficiency, as it is usually better to keep the temperature at a steady level during the day (i.e., when employees are in the office).
+
+* **Difference in Set Temperature** shows three main values: 
+    - **0** when no change between consecutive observations occurs as the thermostat is set up for a specific period to set the radiator at a particular temperature, 
+    - **+16** when the nightly temperature setting (usually = 6) changes to the daily temperature setting (scheduled to set the heater to 22 degrees). 
+    - **-16** when the daily temperature setting (usually = 22) turnes to the nightly temperature setting (programmed to fix the radiator back to 6 degrees). 
+* On this point we could argue, that the heating efficiency could be improved, if more than just two settings of the desired temperature value were introduced, based on how fast the room temperature is increasing ex.:<br/>
+    - The heater could start warming up the room earlier, but not directly so extreme, for instance by setting the temperature first to 14 degrees at 4 a.m., then to 18 degrees at 6 a.m. and then finally a few hours later (ex. at 8 a.m.) to the temperature 22, but without the need for setting the VALVE_STATE to some extreme values such as 99.
+    - The desired temperature could decrease from 22 degrees to 20 degrees already around 4 or 5 p.m. when employees are still in the office and then to 16 degrees already around 7 p.m. so that the actual room temperature would decrease more slowly without rapidly setting the VALVE_STATE from 99 to 0.
+
+* **Actual Room Temperature** indicates most commonly occurring actual room temperature. It is worth noting that we excluded the summer and still the most common value is around 24.25 degrees, which could potentially suggest overheating.
+
+* **Outside Temperature** shows corresponding weather data. 
+
+* **Conclusion:** By looking at the plot in general, we can infer that in general, the control system does a decent job while adjusting the temperature at night. However, during the day AND during the transition from the day and night, there is some room for improvement, especially by introducing more than just two settings for the desired temperature (SET_TEMPERATURE), allowing for a smoother transition between day and night and for more evenly distributed values of the room temperature, as well as less extreme values of the VALVE_STATE.
+
+
+### Only rows indicating change of SET TEMPERATURE
+
+Now we want to filter out only those rows that designate a change:
+```{r}
+rad3_diff_change = rad3_diff[which(rad3_diff[,"DIFF_SET_TEMP"] != 0), ]
+kable(head(rad3_diff_change, 20), "markdown")
+```
+
+* To validate our assumption that the Desired Temperature is usually set to 22 degrees during the day and set to 6 degrees at night, we want to look at the difference between a current value of SET_TEMPERATURE and its previous observation. 
+
+* If this assumption is valid, the difference column (DIFF_SET_TEMP) should primarily take on values -16 (change from the day to the night) and +16 (change from the night to the day).
+
+
+```{r warning=FALSE, message=FALSE}
+df = as.data.frame(rad3_diff_change)
+x = list(title = "Influence of Desired Temp. & Valve on room temp. (Diff. in Set Temp != 0)")
+y = list(title = "Number of occurrences")
+plot_ly(alpha = 0.6) %>%
+  add_histogram(x = ~df$SET_TEMPERATURE, name = "Desired Temperature") %>%
+  add_histogram(x = ~df$VALVE_STATE, name = "State of the Valve") %>%
+  add_histogram(x = ~df$DIFF_SET_TEMP, name = "Difference in Set Temperature") %>%
+  add_histogram(x = ~df$ACTUAL_TEMPERATURE, name = "Actual Room Temperature") %>%
+  add_histogram(x = ~df$weather_xts, name = "Outside Temperature") %>%
+  layout(barmode = "overlay") %>% layout(xaxis = x, yaxis = y)
+
+```
+
+<br/>
+
+* As we can see, we can validate our assumption that the values 22 and 6 degrees are the most common.
+
+* In order to see the impact of the **Desired Temperature** on the **Valve State**, we can select only those two variables in the histogram. This way we can unquestionably see that the green bars in the middle are rising together along with the VALVE_STATE, meaning that most of the values in the SET_TEMPERATURE column, different than 6 or 22 degrees result in the change of VALVE_STATE. 
+
+
+### Time series plot
+
+To look at the variables influencing heating efficiency from the time series perspective, we consider the same variables in an interactive time series plot. This time, we do not use the column DIFF_SET_TEMP, as in this visualization it is not meaningful (*because it would just show for the SET_TEMPERATURE the jumps from one observation to another one*).
+
+```{r}
+dygraph(rad3_diff[, c("ACTUAL_TEMPERATURE", "SET_TEMPERATURE", "VALVE_STATE", "weather_xts")]) %>% dySeries("ACTUAL_TEMPERATURE", label = "Room temp.") %>% dySeries("SET_TEMPERATURE", label = "Desired temp.") %>% dySeries("VALVE_STATE", label = "Valve") %>% dySeries("weather_xts", label = "Outside temp.") %>% dyOptions(fillGraph = TRUE) %>% dyRangeSelector()
+```
+
+### Interpretation of the time series plot
+
+* At first glance, we can notice that during summer the radiators are OFF, which is entirely rational. However, we still were able to find observations such as for RadiatorID = 1 on the 5th May 2016 that the radiator was ON and VALVE set to 81, while the outside temperature was 12.4.The VALVE of RadiatorID = 2 was set at this time to 70.
+
+* By looking at smaller intervals such as one day, we recognize that the heating efficiency leaves a room for improvement since we see that every day the **VALVE_STATE** is set to the maximum value of 99, then the thermostat's control system waits until it gets warmer and afterward turn it continuously lower. From our research, we know that a lot of energy is dissipated if one set the temperature too high, i.e., to the maximum level, because **the warmer the room gets, the faster thermal energy will be lost to the outside**. 
+
+* As an extreme exception from this rule, we can observe the situation in the last week before Christmas 2016. During that period the VALVE_STATE was set to the **maximum** level of 99 **all the time**. This overheating was, likely, caused by employees overwriting the desired SET_TEMPERATURE of 22 degrees to 30 degrees, what we can observed in this plot.
+
+* Again, to achieve optimal comfort and optimal costs, it is recommended to set the thermostats between 20 to 22.2 degrees Celsius and keep it at the steady level during the day, i.e., when employees are in the office.
+
+## Analysis of extreme temperatures
+
+Since we have seen that there are some cases of potential overheating, we want to investigate this closer. For this purpose, we will first look at the time series matrix **xts_radiator** including data for all radiators (without splitting them within a list). Since we do not want to confuse high temperatures experienced in warmer months (May to September) with high temperatures caused by potential excessive heating, we exclude warmer months from this analysis.
+```{r}
+head(xts_radiator)
+xts_hot = xts_radiator[xts_radiator$ACTUAL_TEMPERATURE >= 24, ]
+# exclude warmer months:
+xts_hot1 = xts_hot["20160201/20160430"]
+xts_hot2 = xts_hot["20161001/20161231"]
+xts_hot3 = xts_hot["20170101/20170311"]
+
+overheating = rbind(xts_hot1, xts_hot2, xts_hot3)
+head(overheating)
+nrow(overheating) # 191534
+```
+
+for all radiators:
+
+```{r}
+dygraph(overheating[, c("ACTUAL_TEMPERATURE", "SET_TEMPERATURE", "VALVE_STATE")]) %>% dySeries("ACTUAL_TEMPERATURE", label = "Room temp.") %>% dySeries("SET_TEMPERATURE", label = "Desired Temp.") %>% dySeries("VALVE_STATE", label = "Valve") %>% dyOptions(fillGraph = TRUE) %>% dyRangeSelector()
+```
+
+
+### Interpretation
+
+* Since we plotted the data for all radiators, there are a lot of overlapping data points, denoting that this behavior repeats independently of the heater we pick.
+
+* Only the fact that there were almost 200.000 such data points within nine months, suggesting frequently repeated situation of potential overheating, shows that there may be an issue concerning the heating efficiency.
+
+* To analyze it in further detail, we plot the same data but only for one heater, let's say radiator nr 6. Additionally, we now include the weather data again.
+
+```{r}
+overheating6 = overheating[overheating$RadiatorID == 6, ]
+overheating6 = to.period(overheating6, "hours", OHLC = F)
+index(overheating6) = as.POSIXct(trunc(index(overheating6), units="hours"))
+overheating6 = merge(overheating6, weather_xts, join = "inner")
+dygraph(overheating6[, c("ACTUAL_TEMPERATURE", "SET_TEMPERATURE", "VALVE_STATE", "weather_xts")]) %>% dySeries("ACTUAL_TEMPERATURE", label = "Room temp.") %>% dySeries("SET_TEMPERATURE", label = "Desired temp.") %>% dySeries("VALVE_STATE", label = "Valve") %>% dySeries("weather_xts", label = "Outside temp.") %>% dyOptions(fillGraph = TRUE, colors = c("blue", "green", "orange", "purple")) %>% dyRangeSelector()
+```
+
+
+<br/>
+
+In general, we can see in this plot that potential overheating occurs when the temperatures outside are going down, particularly when the weather data reaches values below 10 degrees. 
+
+* The peaks (i.e., the highest VALVE_STATES) are observed when the temperatures outside are reaching values below zero. We would explain it this way: due to lower temperatures outside, the temperatures inside are also declining, and the control system tries to balance it out by frequently increasing the VALVE_STATE to the highest possible values.
+
+* Again, it is justifiable to increase the heating when it is getting colder outside. However, as we mentioned earlier, it is a tradeoff between comfort and cost savings which must be balanced to find the optimal heating results.
+
+## Analysis of temperatures at nights
+
+* For this analysis, we assume that nobody works in the office in the period between 8 p.m. and 6 a.m.
+
+* We will exclude summer so that we do not confuse overheating with naturally high temperatures.
+
+```{r}
+nights = xts_radiator["T20:00/T06:00"]
+# exclude summer:
+nights1 = nights["20160201/20160531"]
+nights2 = nights["20161001/20161231"]
+nights3 = nights["20170101/20170311"]
+
+nights = rbind(nights1, nights2, nights3)
+
+head(nights)
+nrow(nights) # 390841
+```
+
+
+1. For all radiators:
+```{r}
+dygraph(nights[, c("ACTUAL_TEMPERATURE", "SET_TEMPERATURE", "VALVE_STATE")]) %>% dySeries("ACTUAL_TEMPERATURE", label = "Room temp.") %>% dySeries("SET_TEMPERATURE", label = "Desired temp.") %>% dySeries("VALVE_STATE", label = "Valve") %>% dyOptions(fillGraph = TRUE, colors = c("blue", "green", "orange", "purple")) %>% dyRangeSelector()
+```
+<br/>
+
+2. To compare this to a situation for one chosen radiator, let's say radiatorID = 8:
+```{r}
+nights8 = nights[nights$RadiatorID == 8, ]
+nights8 = to.period(nights, "hours", OHLC = F) 
+index(nights8) = as.POSIXct(trunc(index(nights8), units="hours")) 
+nights8 = merge(nights8, weather_xts, join = "inner")
+
+dygraph(nights8[, c("ACTUAL_TEMPERATURE", "SET_TEMPERATURE", "VALVE_STATE", "weather_xts")]) %>% dySeries("ACTUAL_TEMPERATURE", label = "Room temp.") %>% dySeries("SET_TEMPERATURE", label = "Desired temp.") %>% dySeries("VALVE_STATE", label = "Valve") %>% dySeries("weather_xts", label = "Outside temp.") %>% dyOptions(fillGraph = TRUE, colors = c("blue", "green", "orange", "purple")) %>% dyRangeSelector()
+```
+<br/>
+
+### Interpretation
+
+* In both diagrams, we can see that the radiator is sometimes used at nights and often the VALVE_STATE is set to very high temperatures during those time intervals. But this could be caused by outliers, for example, employees working before 6 a.m. or after 8 p.m. and setting then the desired SET_TEMPERATURE higher, for instance to 30 degrees on 28.11.2016 (as well as ex. on 12. and 13.12.2016) at 8 p.m. 
+
+* Also, this could be caused by thermostat's control system, instructing the radiators in winter to start heating very early (ex. already at 4 or 5 a.m.) so that the room is warm enough when employees start working after 8 a.m.
+
+## Decision Trees
+
+To better understand, how the control system makes decisions on the value of the VALVE_STATE, we will plot a decision tree and try to infer the control system's behavior based on that. As before, we need some preprocessing to make the end-result more accurate and visually appealing.
+
+```{r}
+head(radiator)
+colnames(radiator) = c("Date", "ID", "Valve", "Room Temp", "Desired Temp") # improve column labels
+radiator_wo_summer = subset(radiator, Date <= as.POSIXct("2016-04-30") | Date >= as.POSIXct("2016-10-01")) # exclude summer months, i.e. months when radiators usually are off
+nrow(radiator) # 1259133 in the whole fact table radiator
+nrow(radiator_wo_summer) # 743592 in the subset without summer
+rtree_all_radiators = rpart(Valve ~ ., data = radiator_wo_summer, method = "anova") # fit the tree based on the subset without summer
+rpart.plot(rtree_all_radiators, type = 2, yesno = 2)
+```
+
+* As we can see, the most crucial aspect in determining the required Valve state is the desired temperature (Desired Temp) which is set up by using thermostat settings. 
+
+* The next important split criterion is the actual room temperature, as the control system tries to adjust the VALVE_STATE according to the current room temperature for each time interval.
+
+* We can observe that the columns Date and ID were not chosen as split candidates, which implies that similar patterns are existing in the dataset independently of the radiator that we pick or the hour of the time interval. The only two variables that matter to the control system, in order to decide on the Valve state, are desired temperature and the current room temperature.
+
+* In the decision tree we can see the same pattern that we have seen in the data and plots presented earlier in this report: if the room temperature is not as high as the desired temperature, the Valve state is set to almost maximal value, which results in the prevalence of Valve values of 0 or above 90 in the distribution of the VALVE_STATE column.
+
+* It is important to note that the decision tree above was created based on a data frame containing values for all radiators. Therefore the values in the terminal nodes (i.e., leaf nodes) are averaged across the whole dataset.
+
+* If we would like to create one decision tree for each radiator subset, it could look like this (we do not print those plots in order to keep the report concise):
+```{r eval=FALSE}
+radiators_df_list = list()
+rtrees_list = list()
+for (i in 1:length(unique(radiator_wo_summer$RadiatorID))){
+  radiators_df_list[[i]] = radiator_wo_summer[radiator_wo_summer$ID == i, ][-2]
+  rtrees_list[[i]] = rpart(Valve ~ ., data = radiators_df_list[[i]], method = "anova")
+  rpart.plot(rtrees_list[[i]])
+}
+```
+
+
+## Recommendations
+
+* To sum it up, we need to highlight our main recommendation: **to balance out optimal comfort and costs**, it is recommended to set the thermostats between 20 and 22.2 degrees Celsius and **keep it at the steady level** during the day, i.e., when employees are in the office.
+
+* Change of **thermostat settings**: if actual room temperature reaches a specific threshold value, VALVE_STATE should be slightly adjusted by the control system, but not entirely turned off and not set to the MAXIMUM value. That is why the heating efficiency could be improved, if **more than just two settings of the desired temperature value** were introduced, based on how fast the room temperature is increasing ex.:<br/>
+
+    + The heater could **start warming up the room earlier**, but *not* directly *so extreme*, for instance by setting the temperature first to 14 degrees at 4 a.m., then to 18 degrees at 6 a.m. and then finally a few hours later (ex. at 8 a.m.) to the temperature 22, but without the need for setting the VALVE_STATE to some extreme values such as 99.
+    
+    + The **desired temperature** could **decrease** from 22 degrees to 20 degrees **already** around 4 or 5 p.m. **when employees are still in the office** and then to 16 degrees already around 7 p.m. so that the actual **room temperature would decrease more slowly** without rapidly setting the VALVE_STATE from 99 to 0.
+
+* We also recommend avoiding the idle usage of radiators by programming the thermostat to turn the Valve down at night, even when the desired temperature will be overwritten by employees.
+
+* If the **temperature outside** reaches a particular **threshold** value, such as remarkably low temperatures, the VALVE_STATE could also be slightly adjusted. However, this could be difficult to implement, as it would require synchronization of values of the temperature outside (ex. from the Internet) with the sensor data present in SQL Server.
+
+* Try to find a balance between comfort and heating costs by **avoiding overheating**, especially when the temperatures outside are decreasing.
+
+<br/>
+
+
+# References
+
+1. Weather data from DWD (Deutscher Wetterdienst = German Meteorological Office), retrieved on 21.01.2018: ftp://ftp-cdc.dwd.de/pub/CDC/observations_germany/climate/hourly/air_temperature/) 
+2. What Is The Ideal Temperature To Set Heat To In Winter To ... (n.d.). Retrieved on 19.01.2018 from http://www.assuredclimate.com/ideal-temperature-set-heat-winter-save-money/
+3. Thermostats | Department Of Energy. (n.d.). Retrieved on 19.01.2018 from https://www.energy.gov/energysaver/thermostats
+4. 5 Home Heating Myths That Could Be Pushing Up Your Winter ... (n.d.). Retrieved on 19.01.2018 from http://home.bt.com/lifestyle/house-home/home-hacks/5-home-heating-myths-that-could-be-pushing-up-your-winter-bills-11363946169603  
+5. Data obtained from MLPA on 8.12.2017
+6. Room plan of the office in Fredersdorfer Str. 10, 10243 Berlin obtained from MLPA on 22.12.2017
+7. R packages used in this analysis downloaded from https://cran.r-project.org/ 
+
+<br/><br/>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
