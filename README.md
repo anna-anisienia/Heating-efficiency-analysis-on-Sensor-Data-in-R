@@ -1,4 +1,4 @@
-# Data Science Project 1
+# Data Science Project: heating efficiency analysis on Sensor Data
 This repository contains R code for heating efficiency analysis on Sensor Data.
 
 **Related topics:**
